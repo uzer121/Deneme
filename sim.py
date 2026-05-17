@@ -2,7 +2,7 @@
 Depo Teslimat Robotu - Otonom Navigasyon Simülasyonu
 Mobil Robotlar Ödevi
 
-Kullanılan yapay zeka: Claude (claude-sonnet-4-6)
+Kullanılan yapay zeka: Claude (claude-sonnet-4-6) / GitHub Copilot
 Kullanılan bölümler: Kod iskeleti, algoritma implementasyonu, arayüz tasarımı
 """
 
@@ -12,7 +12,7 @@ import matplotlib.patches as patches
 from matplotlib.widgets import RadioButtons, Button
 import heapq, random, math
 
-# ─── RENKLER ────────────────────────────────────────────────────────────────
+# ─── RENKLER ──────────────────────────────────────────────────────────
 DARK  = "#0d1117"
 PANEL = "#0f3460"
 ACC   = "#e94560"
@@ -23,7 +23,7 @@ SHELF_COLORS = [
 ]
 
 
-# ─── ORTAM ──────────────────────────────────────────────────────────────────
+# ─── ORTAM ───────────────────────────────────────────────────────────
 class Environment:
     def __init__(self):
         self.width  = 20.0
@@ -100,7 +100,7 @@ class Environment:
     is_random=False
 
 
-# ─── SENSÖRLER ──────────────────────────────────────────────────────────────
+# ─── SENSÖRLER ─────────────────────────────────────────────────────────
 class LiDAR:
     def __init__(self, env, num_beams=36, max_range=8.0, noise_std=0.10):
         self.env=env; self.num_beams=num_beams
@@ -157,7 +157,7 @@ def _add_rect(ax, cx,cy,theta,w,h, fc,ec="white",lw=1.2,zorder=7,alpha=1.0):
     ax.add_patch(p); return p
 
 
-# ─── ROBOT MODELLERİ ────────────────────────────────────────────────────────
+# ─── ROBOT MODELLERİ ───────────────────────────────────────────────────────
 _WR = 0.038   # animasyon için teker yarıçapı (m)
 
 class DiffDriveRobot:
@@ -212,7 +212,9 @@ class DiffDriveRobot:
 
 class AckermannRobot:
     """Ackermann (araba) sürüşü — bisiklet modeli kinematiği, min dönüş yarıçapı kısıtı."""
-    name="Ackermann"; L=0.70; max_steer=math.radians(35); holonomic=False
+    # Dingil mesafesini gerçeğe daha uygun ve manevra yapabilir şekilde 0.60 ayarladık.
+    # Dönüş açısını maksimum 40 derece yaptık.
+    name="Ackermann"; L=0.60; max_steer=math.radians(40); holonomic=False
 
     def __init__(self,x,y,theta=0.0):
         self.x=x; self.y=y; self.theta=theta
@@ -429,7 +431,7 @@ ROBOT_TYPES={"Differential":DiffDriveRobot,"Ackermann":AckermannRobot,
              "Mecanum":MecanumRobot,"Unicycle":UnicycleRobot}
 
 
-# ─── LOKALİZASYON ───────────────────────────────────────────────────────────
+# ─── LOKALİZASYON ────────────────────────────────────────────────────────
 class DeadReckoning:
     def __init__(self,x,y,theta,L=0.5):
         self.x=x; self.y=y; self.theta=theta; self.L=L
@@ -652,9 +654,9 @@ PLANNERS={"A*":AStarPlanner,"Dijkstra":DijkstraPlanner,
 # Robota özgü planlama parametreleri
 ROBOT_PLAN_PARAMS={
     "Differential": {"res":0.40,"margin":0.51},  # margin>0.5 → x=0.5 sol sinir disi, gecitlerden gec
-    "Ackermann":    {"res":0.50,"margin":0.51},  # x=0.5 sol sinir disi, gecitler acik
-    "Mecanum":      {"res":0.38,"margin":0.51},  # margin>0.5 → zigzag gecit rotasi
-    "Unicycle":     {"res":0.40,"margin":0.51},  # margin>0.5 → zigzag gecit rotasi
+    "Ackermann":    {"res":0.50,"margin":0.75},  # Ackermann için daha geniş dönüşler, duvarlardan uzakta geniş margin
+    "Mecanum":      {"res":0.38,"margin":0.51},  
+    "Unicycle":     {"res":0.40,"margin":0.51},  
 }
 
 def _smooth_path(path, env, margin, steps=30):
@@ -668,10 +670,26 @@ def _smooth_path(path, env, margin, steps=30):
                                 path[j][0],path[j][1],steps=steps,margin=margin):
                 best=j; break
         result.append(path[best]); i=best
-    return result
+    
+    # Ackermann gibi araçlar için köşeleri yumuşatan bezier-benzeri ekstra bir pah (fillet) geçişi
+    smoothed_result = [result[0]]
+    for k in range(1, len(result)-1):
+        p0, p1, p2 = np.array(result[k-1]), np.array(result[k]), np.array(result[k+1])
+        # P1'e girmeden önce ve sonra noktalar alıp kavisi yumuşatıyoruz
+        v1, v2 = p1 - p0, p2 - p1
+        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        if n1 > 0.5 and n2 > 0.5:
+            smoothed_result.append(tuple(p1 - v1 * 0.2 / n1))
+            smoothed_result.append(tuple(p1))
+            smoothed_result.append(tuple(p1 + v2 * 0.2 / n2))
+        else:
+            smoothed_result.append(result[k])
+    smoothed_result.append(result[-1])
+            
+    return smoothed_result
 
 
-# ─── SİMÜLASYON ─────────────────────────────────────────────────────────────
+# ─── SİMÜLASYON ────────────────────────────────────────────────────────
 class Simulation:
     def __init__(self):
         self.env=Environment()
@@ -743,7 +761,8 @@ class Simulation:
                       self.robot.y-self.env.goal[1])<0.5:
             self.done=True
 
-    def _lookahead_target(self,L_d=0.9):
+    # L_d (lookahead) mesafesini artırdık ki keskin dönüşlerdeki salınımı engelleyelim
+    def _lookahead_target(self,L_d=1.4):
         """Ackermann Pure Pursuit: yol üzerinde L_d mesafedeki noktayı döndürür."""
         path=self.plan_path; r=self.robot; n=len(path)
         if self.path_idx>=n-1: return path[-1]
@@ -760,7 +779,7 @@ class Simulation:
         return path[-1]
 
 
-# ─── GRAFİK ARAYÜZÜ ─────────────────────────────────────────────────────────
+# ─── GRAFİK ARAYÜZÜ ───────────────────���───────────────────────────────────
 class GUI:
     def __init__(self):
         self.sim=Simulation()
@@ -768,7 +787,7 @@ class GUI:
         self._dyn_arts=[]   # çerçeveden çerçeveye silinen dinamik sanatçılar
         self._build()
 
-    # ── İnşa ────────────────────────────────────────────────────────────────
+    # ── İnşa ──────────────────────────────────────────────────────────
     def _build(self):
         self.fig=plt.figure(figsize=(17,9),facecolor=DARK)
         self.fig.suptitle(
@@ -993,7 +1012,7 @@ class GUI:
                 f"Nav: {sim.nav_algo}\nRobot: {sim.robot_type}\n"
                 f"Lok: {sim.loc_algo}\n──────────\n{st}")
 
-    # ── Tick ────────────────────────────────────────────────────────────────
+    # ── Tick ───────────────────────────────────────────────────────────
     def _tick(self):
         try:
             for _ in range(4):
@@ -1061,7 +1080,7 @@ class GUI:
         plt.show()
 
 
-# ─── GİRİŞ ──────────────────────────────────────────────────────────────────
+# ─── GİRİŞ ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     gui=GUI()
     gui.run()
