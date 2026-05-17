@@ -212,25 +212,30 @@ class DiffDriveRobot:
 
 class AckermannRobot:
     """Ackermann (araba) sürüşü — bisiklet modeli kinematiği, min dönüş yarıçapı kısıtı."""
-    # Dingil mesafesini gerçeğe daha uygun ve manevra yapabilir şekilde 0.60 ayarladık.
-    # Dönüş açısını maksimum 40 derece yaptık.
     name="Ackermann"; L=0.60; max_steer=math.radians(40); holonomic=False
 
     def __init__(self,x,y,theta=0.0):
         self.x=x; self.y=y; self.theta=theta
-        self.steer=0.0; self.wangle=0.0   # tüm tekerlekler aynı hızda döner
+        self.steer=0.0; self.wangle=0.0
 
     def control(self,tx,ty):
-        """Pure Pursuit — daire çizmeden yolu izler, min dönüş yarıçapına uyar."""
-        dx=tx-self.x; dy=ty-self.y; dist=math.hypot(dx,dy)
+        """Gerçekçi Pure Pursuit - Geometrik İzleme"""
+        dx=tx-self.x; dy=ty-self.y
+        dist=math.hypot(dx,dy)
+        
+        # Hedefe olan açı farkı
         alpha=math.atan2(dy,dx)-self.theta
         alpha=math.atan2(math.sin(alpha),math.cos(alpha))   # [-π,π]
-        # Pure Pursuit: steer = atan(2L·sin(α) / L_d)
-        ld=max(dist,1.2)
-        steer_des=math.atan2(2*self.L*math.sin(alpha),ld)
+        
+        # Direksiyon açısı hesabı: steer = atan(2 * L * sin(alpha) / L_d)
+        # dist burada gerçek L_d (lookahead) mesafesidir
+        steer_des=math.atan2(2*self.L*math.sin(alpha), max(dist, 0.1))
         self.steer=float(np.clip(steer_des,-self.max_steer,self.max_steer))
-        cos_a=math.cos(alpha)
-        v=min(0.65,0.45*dist)*max(0.15, cos_a if cos_a>0 else 0.15)
+        
+        # Dinamik hız: Direksiyon ne kadar kırıksa araç o kadar yavaşlar (Viraja girince yavaşla)
+        speed_ratio = 1.0 - 0.6 * (abs(self.steer) / self.max_steer)
+        v = 0.70 * speed_ratio
+        
         omega=v*math.tan(self.steer)/self.L
         return v,omega
 
@@ -241,7 +246,6 @@ class AckermannRobot:
         mid=self.theta+dth/2
         self.x+=dS*math.cos(mid); self.y+=dS*math.sin(mid); self.theta+=dth
         self.wangle+=dS/_WR   # animasyon
-        # Gerçek bisiklet hareketine eşdeğer dl/dr (EKF için doğru odometri)
         dl=dS-dth*self.L/2
         dr=dS+dth*self.L/2
         return dl,dr
@@ -653,15 +657,17 @@ PLANNERS={"A*":AStarPlanner,"Dijkstra":DijkstraPlanner,
 
 # Robota özgü planlama parametreleri
 ROBOT_PLAN_PARAMS={
-    "Differential": {"res":0.40,"margin":0.51},  # margin>0.5 → x=0.5 sol sinir disi, gecitlerden gec
-    "Ackermann":    {"res":0.50,"margin":0.75},  # Ackermann için daha geniş dönüşler, duvarlardan uzakta geniş margin
+    "Differential": {"res":0.40,"margin":0.51},
+    "Ackermann":    {"res":0.50,"margin":0.80},  # Duvarlardan çok daha uzaktan kavis çizebilmesi için güvenlik mesafesi eklendi
     "Mecanum":      {"res":0.38,"margin":0.51},  
     "Unicycle":     {"res":0.40,"margin":0.51},  
 }
 
 def _smooth_path(path, env, margin, steps=30):
-    """Açgözlü kısayol düzleştirme — Ackermann için keskin dönüşleri azaltır."""
+    """Açgözlü kısayol düzleştirme + Yoğun Nokta + Hareketli Ortalama Yumuşatması"""
     if len(path)<3: return path
+    
+    # 1. Aşama: Açgözlü düzleştirme (Gereksiz düğümleri temizle)
     result=[path[0]]; i=0
     while i<len(path)-1:
         best=i+1
@@ -670,26 +676,33 @@ def _smooth_path(path, env, margin, steps=30):
                                 path[j][0],path[j][1],steps=steps,margin=margin):
                 best=j; break
         result.append(path[best]); i=best
+        
+    # 2. Aşama: Noktaları sıklaştır (Her 10cm'de bir interpolasyon noktası)
+    dense = []
+    for k in range(len(result)-1):
+        p1 = np.array(result[k])
+        p2 = np.array(result[k+1])
+        dist = np.linalg.norm(p2 - p1)
+        num_pts = max(int(dist / 0.10), 2)
+        for t in np.linspace(0, 1, num_pts, endpoint=False):
+            dense.append((p1 + t * (p2 - p1)))
+    dense.append(np.array(result[-1]))
     
-    # Ackermann gibi araçlar için köşeleri yumuşatan bezier-benzeri ekstra bir pah (fillet) geçişi
-    smoothed_result = [result[0]]
-    for k in range(1, len(result)-1):
-        p0, p1, p2 = np.array(result[k-1]), np.array(result[k]), np.array(result[k+1])
-        # P1'e girmeden önce ve sonra noktalar alıp kavisi yumuşatıyoruz
-        v1, v2 = p1 - p0, p2 - p1
-        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-        if n1 > 0.5 and n2 > 0.5:
-            smoothed_result.append(tuple(p1 - v1 * 0.2 / n1))
-            smoothed_result.append(tuple(p1))
-            smoothed_result.append(tuple(p1 + v2 * 0.2 / n2))
-        else:
-            smoothed_result.append(result[k])
-    smoothed_result.append(result[-1])
-            
-    return smoothed_result
+    # 3. Aşama: Hareketli ortalama (Moving Average) ile A* keskin köşelerini gerçeğe uygun viraj yap
+    smoothed = []
+    window = min(15, len(dense)//3)  # Kavis yarıçapını belirler
+    for idx in range(len(dense)):
+        start = max(0, idx - window)
+        end = min(len(dense), idx + window + 1)
+        pts = dense[start:end]
+        sx = sum(p[0] for p in pts) / len(pts)
+        sy = sum(p[1] for p in pts) / len(pts)
+        smoothed.append((float(sx), float(sy)))
+        
+    return smoothed
 
 
-# ─── SİMÜLASYON ────────────────────────────────────────────────────────
+# ─── SİMÜLASYON ─────────────────────────────────────────────────���──────
 class Simulation:
     def __init__(self):
         self.env=Environment()
@@ -711,30 +724,24 @@ class Simulation:
         self.path_idx=0; self.done=False
         pp=ROBOT_PLAN_PARAMS[self.robot_type]
         raw=PLANNERS[self.nav_algo](self.env,**pp).plan(self.env.start,self.env.goal)
-        # Tüm robotlar için yol düzleştirme — waypoint sayısını azaltır
+        # Tüm robotlar için yol düzleştirme
         self.plan_path=_smooth_path(raw,self.env,pp["margin"],steps=50)
 
     def step(self,dt=0.1):
         if self.done: return
         path=self.plan_path; n=len(path); r=self.robot
-        if self.path_idx>=n:
-            self.done=True; return
 
         if self.robot_type=="Ackermann":
-            # Arkada kalan veya çok yakın waypoint'leri atla
-            while self.path_idx<n-1:
-                wx,wy=path[self.path_idx]
-                dx,dy=wx-r.x,wy-r.y
-                fwd=dx*math.cos(r.theta)+dy*math.sin(r.theta)
-                if math.hypot(dx,dy)<0.5 or fwd<-0.15:
-                    self.path_idx+=1
-                else: break
-            if self.path_idx>=n: self.done=True; return
             target=self._lookahead_target()
+            # Bitiş kontrolü (Ackermann aracı hedefin yakınından geçince bitir)
+            if self.path_idx >= n - 15 and math.hypot(r.x-path[-1][0], r.y-path[-1][1]) < 0.8:
+                self.done=True; return
         else:
             target=path[self.path_idx]
             if math.hypot(target[0]-r.x,target[1]-r.y)<0.35:
-                self.path_idx+=1; return
+                self.path_idx+=1
+            if self.path_idx>=n:
+                self.done=True; return
 
         v,omega=self.robot.control(target[0],target[1])
         dl_t,dr_t=self.robot.step(v,omega,dt)
@@ -757,29 +764,51 @@ class Simulation:
         self.errors_dr.append(math.hypot(self.dr.x-self.robot.x,
                                          self.dr.y-self.robot.y))
         self.t+=dt; self.times.append(self.t)
-        if math.hypot(self.robot.x-self.env.goal[0],
-                      self.robot.y-self.env.goal[1])<0.5:
+        
+        if math.hypot(self.robot.x-self.env.goal[0], self.robot.y-self.env.goal[1])<0.5:
             self.done=True
 
-    # L_d (lookahead) mesafesini artırdık ki keskin dönüşlerdeki salınımı engelleyelim
-    def _lookahead_target(self,L_d=1.4):
-        """Ackermann Pure Pursuit: yol üzerinde L_d mesafedeki noktayı döndürür."""
-        path=self.plan_path; r=self.robot; n=len(path)
-        if self.path_idx>=n-1: return path[-1]
-        px,py=path[self.path_idx]
-        cum=math.hypot(px-r.x,py-r.y)
-        if cum>=L_d: return (px,py)
-        for i in range(self.path_idx,n-1):
-            seg=math.hypot(path[i+1][0]-path[i][0],path[i+1][1]-path[i][1])
-            if cum+seg>=L_d:
-                t=(L_d-cum)/seg if seg>0 else 0.0
-                return (path[i][0]+t*(path[i+1][0]-path[i][0]),
-                        path[i][1]+t*(path[i+1][1]-path[i][1]))
-            cum+=seg
+    def _lookahead_target(self, L_d=1.5):
+        """Çember-Doğru Kesişimi ile Geometrik Pure Pursuit Hedefi Bulma"""
+        path = self.plan_path; r = self.robot; n = len(path)
+        
+        # 1. Rotadaki en yakın noktayı bul (Geriye gitmeyi engellemek için mevcut indeksten ileriye bak)
+        search_range = min(self.path_idx + 40, n)
+        dists = [math.hypot(path[i][0]-r.x, path[i][1]-r.y) for i in range(self.path_idx, search_range)]
+        if not dists: return path[-1]
+        
+        self.path_idx = self.path_idx + int(np.argmin(dists))
+        
+        # 2. En yakın noktadan itibaren L_d mesafesindeki kesişimi bul
+        for i in range(self.path_idx, n - 1):
+            p1 = np.array(path[i])
+            p2 = np.array(path[i+1])
+            v = p2 - p1
+            l = np.linalg.norm(v)
+            if l < 1e-5: continue
+            
+            v_norm = v / l
+            w = p1 - np.array([r.x, r.y])
+            
+            # Formül: a*t^2 + b*t + c = 0 (Çember formülü ile doğru segmenti kesişimi)
+            a = 1.0
+            b = 2.0 * np.dot(w, v_norm)
+            c = np.dot(w, w) - L_d**2
+            
+            discriminant = b**2 - 4*a*c
+            if discriminant >= 0:
+                discriminant = math.sqrt(discriminant)
+                t1 = (-b - discriminant) / 2.0
+                t2 = (-b + discriminant) / 2.0
+                
+                # İleri yöndeki kesişimi al (t2 genelde daha ileridedir)
+                if 0 <= t2 <= l: return tuple(p1 + t2 * v_norm)
+                if 0 <= t1 <= l: return tuple(p1 + t1 * v_norm)
+                
         return path[-1]
 
 
-# ─── GRAFİK ARAYÜZÜ ───────────────────���───────────────────────────────────
+# ─── GRAFİK ARAYÜZÜ ───────────────────────────────────────────────────────
 class GUI:
     def __init__(self):
         self.sim=Simulation()
