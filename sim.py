@@ -6,19 +6,11 @@ Kullanılan yapay zeka: Claude (claude-sonnet-4-6)
 Kullanılan bölümler: Kod iskeleti, algoritma implementasyonu, arayüz tasarımı
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.collections import LineCollection
 from matplotlib.widgets import RadioButtons, Button
-import heapq
-import random
-import math
-from typing import List, Tuple
+import heapq, random, math
 
 # ─── RENKLER ────────────────────────────────────────────────────────────────
 DARK  = "#0d1117"
@@ -31,19 +23,6 @@ SHELF_COLORS = [
 ]
 
 
-# ─── PROFESYONEL AYARLAR ────────────────────────────────────────────────────
-@dataclass
-class SimConfig:
-    dt: float = 0.1
-    steps_per_tick: int = 4
-    timer_ms: int = 50
-    lidar_ray_stride: int = 6
-    lidar_update_every: int = 1
-    loc_update_every: int = 1
-    err_update_every: int = 1
-    fps_ema_alpha: float = 0.12
-
-
 # ─── ORTAM ──────────────────────────────────────────────────────────────────
 class Environment:
     def __init__(self):
@@ -53,16 +32,16 @@ class Environment:
         self.goal   = (19.0, 14.0)
         # Üç yatay bariyer — geçit: SAĞ → ORTA → SOL (zigzag)
         self.obstacles = [
-            ( 2.0,  4.0, 12.0,  5.5),
+            ( 1.0,  4.0, 12.0,  5.5),
             (14.0,  4.0, 19.0,  5.5),
-            ( 2.0,  8.0,  8.5,  9.5),
+            ( 1.0,  8.0,  8.5,  9.5),
             (11.0,  8.0, 19.0,  9.5),
-            ( 2.0, 11.5,  5.5, 13.0),
+            ( 1.0, 11.5,  5.5, 13.0),
             ( 8.0, 11.5, 19.0, 13.0),
-            ( 9.0,  1.5, 11.0,  3.0),
+            ( 9.0,  1.5, 11.0,  2.2),
             ( 5.0,  6.0,  7.0,  7.5),
-            (13.5,  6.0, 15.5,  7.5),
-            (10.5, 10.5, 12.5, 11.5),
+            (15.5,  6.5, 17.5,  8.0),
+            (12.0, 10.5, 14.0, 11.5),
             ( 3.0, 10.0,  4.5, 11.0),
             (16.5, 10.5, 18.0, 11.5),
         ]
@@ -72,34 +51,63 @@ class Environment:
             "Kutu3","Kutu4","Kutu5",
         ]
 
-    def in_obstacle(self, x: float, y: float, margin: float = 0.32) -> bool:
+    def in_obstacle(self, x, y, margin=0.32):
         for (x1,y1,x2,y2) in self.obstacles:
             if x1-margin<=x<=x2+margin and y1-margin<=y<=y2+margin:
                 return True
         return False
 
-    def in_bounds(self, x: float, y: float, margin: float = 0.32) -> bool:
+    def in_bounds(self, x, y, margin=0.32):
         return margin<=x<=self.width-margin and margin<=y<=self.height-margin
 
-    def is_free(self, x: float, y: float, margin: float = 0.32) -> bool:
+    def is_free(self, x, y, margin=0.32):
         return self.in_bounds(x,y,margin) and not self.in_obstacle(x,y,margin)
 
-    def segment_free(self, x1: float, y1: float, x2: float, y2: float, steps: int = 25) -> bool:
+    def segment_free(self, x1,y1,x2,y2,steps=28,margin=0.32):
         for i in range(steps+1):
             t=i/steps
-            if not self.is_free(x1+t*(x2-x1),y1+t*(y2-y1)):
+            if not self.is_free(x1+t*(x2-x1),y1+t*(y2-y1),margin):
                 return False
         return True
+
+    def randomize(self):
+        """Rastgele engel konumları — başlangıç/hedef çevresi korunur."""
+        new_obs=[]
+        attempts=0
+        while len(new_obs)<12 and attempts<8000:
+            attempts+=1
+            x1=random.uniform(1.2,15.0)
+            y1=random.uniform(1.2,11.5)
+            w=random.uniform(0.8,3.5)
+            h=random.uniform(0.6,1.8)
+            x2=min(x1+w,19.2); y2=min(y1+h,13.8)
+            cx=(x1+x2)/2; cy=(y1+y2)/2
+            # Başlangıç ve hedeften uzak tut
+            if math.hypot(cx-self.start[0],cy-self.start[1])<2.8: continue
+            if math.hypot(cx-self.goal[0], cy-self.goal[1])<2.8:  continue
+            # Mevcut engellerle çok fazla örtüşme olmasın
+            ok=True
+            for (ox1,oy1,ox2,oy2) in new_obs:
+                if x1<ox2+0.5 and x2>ox1-0.5 and y1<oy2+0.5 and y2>oy1-0.5:
+                    ok=False; break
+            if ok:
+                new_obs.append((x1,y1,x2,y2))
+        self.obstacles=new_obs
+        self.labels=[f"Engel{i+1}" for i in range(len(new_obs))]
+        self.is_random=True
+
+    # Varsayılan map mi?
+    is_random=False
 
 
 # ─── SENSÖRLER ──────────────────────────────────────────────────────────────
 class LiDAR:
-    def __init__(self, env: Environment, num_beams: int = 36, max_range: float = 8.0, noise_std: float = 0.10):
+    def __init__(self, env, num_beams=36, max_range=8.0, noise_std=0.10):
         self.env=env; self.num_beams=num_beams
         self.max_range=max_range; self.noise_std=noise_std
         self.angles=np.linspace(0,2*np.pi,num_beams,endpoint=False)
 
-    def scan(self, x: float, y: float, theta: float) -> Tuple[np.ndarray, np.ndarray]:
+    def scan(self, x, y, theta):
         raw, filt = [], []
         for a in self.angles:
             d=self._cast(x,y,theta+a)
@@ -107,37 +115,37 @@ class LiDAR:
             filt.append(max(0.05,d))
         return np.array(raw), np.array(filt)
 
-    def _cast(self, x: float, y: float, angle: float) -> float:
+    def _cast(self, x, y, angle):
         cos_a=math.cos(angle); sin_a=math.sin(angle)
         for d in np.arange(0.1, self.max_range, 0.08):
             if not self.env.is_free(x+d*cos_a, y+d*sin_a, margin=0.0):
                 return d
         return self.max_range
 
-    def to_points(self, x: float, y: float, theta: float, ranges: np.ndarray) -> List[Tuple[float,float]]:
+    def to_points(self, x, y, theta, ranges):
         return [(x+r*math.cos(theta+a), y+r*math.sin(theta+a))
                 for a,r in zip(self.angles,ranges)]
 
 
 class IMU:
-    def __init__(self, noise_std: float = 0.012, bias: float = 0.003):
+    def __init__(self, noise_std=0.012, bias=0.003):
         self.noise_std=noise_std; self.bias=bias
 
-    def measure(self, omega: float) -> float:
+    def measure(self, omega):
         return omega+self.bias+np.random.normal(0,self.noise_std)
 
 
 class Encoder:
-    def __init__(self, slip: float = 0.01):
+    def __init__(self, slip=0.01):
         self.slip=slip
 
-    def measure(self, dl: float, dr: float) -> Tuple[float,float]:
+    def measure(self, dl, dr):
         return (dl*(1+np.random.uniform(-self.slip,self.slip)),
                 dr*(1+np.random.uniform(-self.slip,self.slip)))
 
 
 # ─── ROBOT ÇİZİM YARDIMCISI ─────────────────────────────────────────────────
-def _rect_poly(cx: float, cy: float, theta: float, w: float, h: float):
+def _rect_poly(cx, cy, theta, w, h):
     c,s=math.cos(theta),math.sin(theta)
     hw,hh=w/2,h/2
     pts=[(-hw,-hh),(hw,-hh),(hw,hh),(-hw,hh)]
@@ -150,14 +158,17 @@ def _add_rect(ax, cx,cy,theta,w,h, fc,ec="white",lw=1.2,zorder=7,alpha=1.0):
 
 
 # ─── ROBOT MODELLERİ ────────────────────────────────────────────────────────
+_WR = 0.038   # animasyon için teker yarıçapı (m)
+
 class DiffDriveRobot:
+    """Diferansiyel sürüş — her teker bağımsız döner; dönüşlerde iç teker yavaşlar."""
     name="Differential"; L=0.5; holonomic=False
 
-    def __init__(self,x: float,y: float,theta: float = 0.0):
+    def __init__(self,x,y,theta=0.0):
         self.x=x; self.y=y; self.theta=theta
-        self.L=self.__class__.L
+        self.wl=0.0; self.wr=0.0   # teker dönme açıları (animasyon)
 
-    def control(self,tx: float,ty: float) -> Tuple[float,float]:
+    def control(self,tx,ty):
         dx=tx-self.x; dy=ty-self.y; dist=math.hypot(dx,dy)
         des=math.atan2(dy,dx)
         aerr=math.atan2(math.sin(des-self.theta),math.cos(des-self.theta))
@@ -165,59 +176,12 @@ class DiffDriveRobot:
         omega=float(np.clip(2.5*aerr,-2.5,2.5))
         return v,omega
 
-    def true_omega(self, v: float, omega_cmd: float) -> float:
-        return omega_cmd
-
-    def step(self,v: float,omega: float,dt: float = 0.1) -> Tuple[float,float]:
+    def step(self,v,omega,dt=0.1):
         dl=(v-omega*self.L/2)*dt; dr=(v+omega*self.L/2)*dt
         dS=(dl+dr)/2; dth=(dr-dl)/self.L
         mid=self.theta+dth/2
         self.x+=dS*math.cos(mid); self.y+=dS*math.sin(mid); self.theta+=dth
-        return dl,dr
-
-    def draw(self,ax):
-        arts=[]
-        c,s=math.cos(self.theta),math.sin(self.theta)
-        lf=np.array([-s,c])
-        pos=np.array([self.x,self.y])
-        arts.append(_add_rect(ax,self.x,self.y,self.theta,0.55,0.35,
-                               fc="#2471a3",ec="#85c1e9",lw=1.5,zorder=7))
-        for side in [-1,1]:
-            wc=pos+lf*side*0.22
-            arts.append(_add_rect(ax,wc[0],wc[1],self.theta,0.20,0.08,
-                                   fc="#1c1c1c",ec="#7f8c8d",lw=1,zorder=8))
-        ex=self.x+0.38*c; ey=self.y+0.38*s
-        arts.append(ax.annotate("",xy=(ex,ey),xytext=(self.x,self.y),
-            arrowprops=dict(arrowstyle="->",color="#f1c40f",lw=2.0),zorder=9))
-        return arts
-
-
-class AckermannRobot:
-    name="Ackermann"; L=0.70; max_steer=math.radians(35); holonomic=False
-
-    def __init__(self,x: float,y: float,theta: float = 0.0):
-        self.x=x; self.y=y; self.theta=theta; self.steer=0.0
-        self.L=self.__class__.L
-
-    def control(self,tx: float,ty: float) -> Tuple[float,float]:
-        dx=tx-self.x; dy=ty-self.y; dist=math.hypot(dx,dy)
-        des=math.atan2(dy,dx)
-        aerr=math.atan2(math.sin(des-self.theta),math.cos(des-self.theta))
-        v=min(0.7,0.5*dist)
-        omega=float(np.clip(2.5*aerr,-2.5,2.5))
-        self.steer=float(np.clip(
-            math.atan2(omega*self.L,v) if abs(v)>0.01 else 0.0,
-            -self.max_steer, self.max_steer))
-        return v,omega
-
-    def true_omega(self, v: float, omega_cmd: float) -> float:
-        return v*math.tan(self.steer)/self.L
-
-    def step(self,v: float,omega: float,dt: float = 0.1) -> Tuple[float,float]:
-        dth=v*math.tan(self.steer)/self.L*dt
-        mid=self.theta+dth/2
-        self.x+=v*math.cos(mid)*dt; self.y+=v*math.sin(mid)*dt; self.theta+=dth
-        dl=(v-omega*self.L/2)*dt; dr=(v+omega*self.L/2)*dt
+        self.wl+=dl/_WR; self.wr+=dr/_WR   # farklı hızda dönerler
         return dl,dr
 
     def draw(self,ax):
@@ -225,41 +189,127 @@ class AckermannRobot:
         c,s=math.cos(self.theta),math.sin(self.theta)
         fw=np.array([c,s]); lf=np.array([-s,c])
         pos=np.array([self.x,self.y])
-        # Body
+        # Gövde
+        arts.append(_add_rect(ax,self.x,self.y,self.theta,0.55,0.35,
+                               fc="#2471a3",ec="#85c1e9",lw=1.5,zorder=7))
+        # Tekerlekler + dönen spoke
+        for side,wa in [(-1,self.wl),(1,self.wr)]:
+            wc=pos+lf*side*0.22
+            arts.append(_add_rect(ax,wc[0],wc[1],self.theta,0.20,0.08,
+                                   fc="#1c1c1c",ec="#7f8c8d",lw=1,zorder=8))
+            # Spoke — teker dönüşünü 2D'de göster (fw eksenine projeksiyon)
+            sp_c=math.cos(wa); sp_s=math.sin(wa)
+            sp_fw=fw*0.09*sp_c; sp_lf=lf*side*0.04*sp_s
+            sx,sy=wc[0]+sp_fw[0]+sp_lf[0], wc[1]+sp_fw[1]+sp_lf[1]
+            ln,=ax.plot([wc[0],sx],[wc[1],sy],"-",color="#bdc3c7",lw=1.5,zorder=9)
+            arts.append(ln)
+        # Yön oku
+        arts.append(ax.annotate("",xy=(self.x+0.38*c,self.y+0.38*s),
+            xytext=(self.x,self.y),
+            arrowprops=dict(arrowstyle="->",color="#f1c40f",lw=2.0),zorder=10))
+        return arts
+
+
+class AckermannRobot:
+    """Ackermann (araba) sürüşü — bisiklet modeli kinematiği, min dönüş yarıçapı kısıtı."""
+    name="Ackermann"; L=0.70; max_steer=math.radians(35); holonomic=False
+
+    def __init__(self,x,y,theta=0.0):
+        self.x=x; self.y=y; self.theta=theta
+        self.steer=0.0; self.wangle=0.0   # tüm tekerlekler aynı hızda döner
+
+    def control(self,tx,ty):
+        """Pure Pursuit — daire çizmeden yolu izler, min dönüş yarıçapına uyar."""
+        dx=tx-self.x; dy=ty-self.y; dist=math.hypot(dx,dy)
+        alpha=math.atan2(dy,dx)-self.theta
+        alpha=math.atan2(math.sin(alpha),math.cos(alpha))   # [-π,π]
+        # Pure Pursuit: steer = atan(2L·sin(α) / L_d)
+        ld=max(dist,1.2)
+        steer_des=math.atan2(2*self.L*math.sin(alpha),ld)
+        self.steer=float(np.clip(steer_des,-self.max_steer,self.max_steer))
+        cos_a=math.cos(alpha)
+        v=min(0.65,0.45*dist)*max(0.15, cos_a if cos_a>0 else 0.15)
+        omega=v*math.tan(self.steer)/self.L
+        return v,omega
+
+    def step(self,v,omega,dt=0.1):
+        # Gerçek bisiklet modeli kinematiği
+        dth=v*math.tan(self.steer)/self.L*dt
+        dS=v*dt
+        mid=self.theta+dth/2
+        self.x+=dS*math.cos(mid); self.y+=dS*math.sin(mid); self.theta+=dth
+        self.wangle+=dS/_WR   # animasyon
+        # Gerçek bisiklet hareketine eşdeğer dl/dr (EKF için doğru odometri)
+        dl=dS-dth*self.L/2
+        dr=dS+dth*self.L/2
+        return dl,dr
+
+    def draw(self,ax):
+        arts=[]
+        c,s=math.cos(self.theta),math.sin(self.theta)
+        fw=np.array([c,s]); lf=np.array([-s,c])
+        pos=np.array([self.x,self.y])
+        # Gövde
         arts.append(_add_rect(ax,self.x,self.y,self.theta,0.78,0.34,
                                fc="#922b21",ec="#f1948a",lw=1.5,zorder=7))
-        # Roof
         rpos=pos+fw*0.05
         arts.append(_add_rect(ax,rpos[0],rpos[1],self.theta,0.32,0.22,
                                fc="#7b241c",ec="#f1948a",lw=1,zorder=8,alpha=0.9))
-        # Rear wheels (fixed)
+        # Arka tekerlekler (sabit) + spoke
         rax=pos-fw*0.26
+        sp_c=math.cos(self.wangle); sp_s=math.sin(self.wangle)
         for side in [-1,1]:
             wc=rax+lf*side*0.22
             arts.append(_add_rect(ax,wc[0],wc[1],self.theta,0.16,0.08,
                                    fc="#1c1c1c",ec="#7f8c8d",lw=1,zorder=9))
-        # Front wheels (steered)
-        fax=pos+fw*0.26
-        fth=self.theta+self.steer
+            sx=wc[0]+fw[0]*0.07*sp_c+lf[0]*side*0.035*sp_s
+            sy=wc[1]+fw[1]*0.07*sp_c+lf[1]*side*0.035*sp_s
+            ln,=ax.plot([wc[0],sx],[wc[1],sy],"-",color="#aaa",lw=1.5,zorder=10)
+            arts.append(ln)
+        # Ön tekerlekler (dönen) + spoke
+        fax=pos+fw*0.26; fth=self.theta+self.steer
+        fc2=math.cos(fth); fs2=math.sin(fth)
+        fw2=np.array([fc2,fs2]); lf2=np.array([-fs2,fc2])
         for side in [-1,1]:
             wc=fax+lf*side*0.22
             arts.append(_add_rect(ax,wc[0],wc[1],fth,0.16,0.08,
                                    fc="#1c1c1c",ec="#bdc3c7",lw=1,zorder=9))
-        ex=self.x+0.5*c; ey=self.y+0.5*s
-        arts.append(ax.annotate("",xy=(ex,ey),xytext=(self.x,self.y),
-            arrowprops=dict(arrowstyle="->",color="#f39c12",lw=2.0),zorder=10))
+            sx=wc[0]+fw2[0]*0.07*sp_c+lf2[0]*side*0.035*sp_s
+            sy=wc[1]+fw2[1]*0.07*sp_c+lf2[1]*side*0.035*sp_s
+            ln,=ax.plot([wc[0],sx],[wc[1],sy],"-",color="#eee",lw=1.5,zorder=10)
+            arts.append(ln)
+        # Dönüş yarıçapı yayı — Ackermann kısıtını görsel göster
+        if abs(self.steer)>0.06:
+            R=self.L/math.tan(self.steer)
+            abs_R=abs(R)
+            tc_x=self.x-R*math.sin(self.theta)
+            tc_y=self.y+R*math.cos(self.theta)
+            ang_rob=math.degrees(math.atan2(self.y-tc_y,self.x-tc_x))
+            span=75
+            t1,t2=(ang_rob,ang_rob+span) if R>0 else (ang_rob-span,ang_rob)
+            arc=patches.Arc((tc_x,tc_y),2*abs_R,2*abs_R,angle=0,
+                             theta1=t1,theta2=t2,
+                             color="#00e5ff",lw=1.2,ls="--",zorder=5,alpha=0.75)
+            ax.add_patch(arc); arts.append(arc)
+            dot,=ax.plot([tc_x],[tc_y],"+",color="#00e5ff",ms=7,zorder=5,alpha=0.6)
+            arts.append(dot)
+        # Hız oku
+        arts.append(ax.annotate("",xy=(self.x+0.5*c,self.y+0.5*s),
+            xytext=(self.x,self.y),
+            arrowprops=dict(arrowstyle="->",color="#f39c12",lw=2.0),zorder=11))
         return arts
 
 
 class MecanumRobot:
+    """Mecanum / Omni sürüş — holonomik; herhangi bir yönde hareket edebilir."""
     name="Mecanum"; L=0.5; holonomic=True
 
-    def __init__(self,x: float,y: float,theta: float = 0.0):
+    def __init__(self,x,y,theta=0.0):
         self.x=x; self.y=y; self.theta=theta
         self.vx_w=0.0; self.vy_w=0.0
-        self.L=self.__class__.L
+        self.roller_spin=0.0   # roller animasyon açısı
 
-    def control(self,tx: float,ty: float) -> Tuple[float,float]:
+    def control(self,tx,ty):
         dx=tx-self.x; dy=ty-self.y; dist=math.hypot(dx,dy)
         speed=min(0.8,0.5*dist)
         if dist>0.01:
@@ -271,13 +321,12 @@ class MecanumRobot:
         omega=float(np.clip(1.5*aerr,-2.0,2.0))
         return speed,omega
 
-    def true_omega(self, v: float, omega_cmd: float) -> float:
-        return omega_cmd
-
-    def step(self,v: float,omega: float,dt: float = 0.1) -> Tuple[float,float]:
+    def step(self,v,omega,dt=0.1):
         nx=self.x+self.vx_w*dt; ny=self.y+self.vy_w*dt
         self.x=float(np.clip(nx,0.35,19.65)); self.y=float(np.clip(ny,0.35,14.65))
         self.theta+=omega*dt
+        vm=math.hypot(self.vx_w,self.vy_w)
+        self.roller_spin+=vm*dt/_WR   # roller dönüşü hız büyüklüğüne göre
         dl=(v-omega*self.L/2)*dt; dr=(v+omega*self.L/2)*dt
         return dl,dr
 
@@ -286,37 +335,49 @@ class MecanumRobot:
         c,s=math.cos(self.theta),math.sin(self.theta)
         fw=np.array([c,s]); lf=np.array([-s,c])
         pos=np.array([self.x,self.y])
+        # Gövde
         arts.append(_add_rect(ax,self.x,self.y,self.theta,0.46,0.46,
                                fc="#7d3c98",ec="#d2b4de",lw=1.5,zorder=7))
-        # Mecanum wheels with roller angle
+        # 4 mecanum tekerleği + dönen roller çizgileri
         wheel_offsets=[ fw*0.17+lf*0.27,  fw*0.17-lf*0.27,
                        -fw*0.17+lf*0.27, -fw*0.17-lf*0.27]
-        roller_off=[45,-45,-45,45]
-        for wp,ra in zip(wheel_offsets,roller_off):
+        roller_signs=[1,-1,-1,1]   # roller 45° yönü (FL,FR,RL,RR)
+        for wp,rsign in zip(wheel_offsets,roller_signs):
             wc=pos+wp
-            arts.append(_add_rect(ax,wc[0],wc[1],self.theta+math.radians(ra),
-                                   0.16,0.07,fc="#1c1c1c",ec="#d2b4de",lw=1,zorder=8))
-        # World velocity arrow
+            wth=self.theta+rsign*math.pi/4
+            arts.append(_add_rect(ax,wc[0],wc[1],wth,0.17,0.07,
+                                   fc="#1c1c1c",ec="#d2b4de",lw=1,zorder=8))
+            # Dönen roller işareti: teker üzerinde kayan nokta
+            r_ang=self.roller_spin*rsign
+            rc=math.cos(wth); rs=math.sin(wth)
+            rfx=np.array([rc,rs]); rlf=np.array([-rs,rc])
+            dot_pos=np.array([wc[0],wc[1]])+rfx*0.06*math.cos(r_ang)+rlf*0.025*math.sin(r_ang)
+            d,=ax.plot([dot_pos[0]],[dot_pos[1]],"o",
+                       color="#a9cce3",ms=3,zorder=10,alpha=0.9)
+            arts.append(d)
+        # Dünya hız vektörü (belirgin ok)
         vm=math.hypot(self.vx_w,self.vy_w)
         if vm>0.05:
-            ex=self.x+0.5*self.vx_w/vm; ey=self.y+0.5*self.vy_w/vm
+            ex=self.x+0.55*self.vx_w/vm; ey=self.y+0.55*self.vy_w/vm
             arts.append(ax.annotate("",xy=(ex,ey),xytext=(self.x,self.y),
-                arrowprops=dict(arrowstyle="->",color="#a9cce3",lw=2.0),zorder=9))
-        # Heading arrow (smaller)
-        arts.append(ax.annotate("",xy=(self.x+0.3*c,self.y+0.3*s),
+                arrowprops=dict(arrowstyle="-|>",color="#00e5ff",lw=2.5,
+                                mutation_scale=12),zorder=11))
+        # Heading oku (ince)
+        arts.append(ax.annotate("",xy=(self.x+0.28*c,self.y+0.28*s),
             xytext=(self.x,self.y),
-            arrowprops=dict(arrowstyle="->",color="#d7bde2",lw=1.2),zorder=9))
+            arrowprops=dict(arrowstyle="->",color="#d7bde2",lw=1.0),zorder=9))
         return arts
 
 
 class UnicycleRobot:
+    """Tekerlekli denge robotu — tek eksen sürüşü, spoke dönüşüyle görselleştirilir."""
     name="Unicycle"; L=0.5; holonomic=False
 
-    def __init__(self,x: float,y: float,theta: float = 0.0):
+    def __init__(self,x,y,theta=0.0):
         self.x=x; self.y=y; self.theta=theta
-        self.L=self.__class__.L
+        self.wangle=0.0   # teker dönme açısı
 
-    def control(self,tx: float,ty: float) -> Tuple[float,float]:
+    def control(self,tx,ty):
         dx=tx-self.x; dy=ty-self.y; dist=math.hypot(dx,dy)
         des=math.atan2(dy,dx)
         aerr=math.atan2(math.sin(des-self.theta),math.cos(des-self.theta))
@@ -324,31 +385,43 @@ class UnicycleRobot:
         omega=float(np.clip(3.0*aerr,-3.0,3.0))
         return v,omega
 
-    def true_omega(self, v: float, omega_cmd: float) -> float:
-        return omega_cmd
-
-    def step(self,v: float,omega: float,dt: float = 0.1) -> Tuple[float,float]:
+    def step(self,v,omega,dt=0.1):
         self.x+=v*math.cos(self.theta)*dt; self.y+=v*math.sin(self.theta)*dt
         self.theta+=omega*dt
         dl=(v-omega*self.L/2)*dt; dr=(v+omega*self.L/2)*dt
+        self.wangle+=v*dt/_WR   # teker ileri dönüşü
         return dl,dr
 
     def draw(self,ax):
         arts=[]
         c,s=math.cos(self.theta),math.sin(self.theta)
-        lf=np.array([-s,c])
+        fw=np.array([c,s]); lf=np.array([-s,c])
+        # Dış çember
         circ=patches.Circle((self.x,self.y),0.27,fc="#16a085",ec="#a2d9ce",lw=2,zorder=7)
         ax.add_patch(circ); arts.append(circ)
+        # Merkez göbek
         hub=patches.Circle((self.x,self.y),0.07,fc="#0e6655",ec="#a2d9ce",lw=1,zorder=8)
         ax.add_patch(hub); arts.append(hub)
-        # Wheel plane line
+        # Teker düzlemi (siyah çizgi — axle yönü)
         w1=np.array([self.x,self.y])+lf*0.27
         w2=np.array([self.x,self.y])-lf*0.27
         ln,=ax.plot([w1[0],w2[0]],[w1[1],w2[1]],"-",color="#1c1c1c",lw=4,zorder=9)
         arts.append(ln)
+        # Dönen spoke — ileri hıza göre döner, dönüş yönünü gösterir
+        sp_c=math.cos(self.wangle); sp_s=math.sin(self.wangle)
+        sx=self.x+fw[0]*0.25*sp_c+lf[0]*0.25*sp_s
+        sy=self.y+fw[1]*0.25*sp_c+lf[1]*0.25*sp_s
+        sp,=ax.plot([self.x,sx],[self.y,sy],"-",color="#f8c471",lw=2.2,zorder=10)
+        arts.append(sp)
+        # Dönen spoke (zıt uç)
+        sx2=self.x-fw[0]*0.25*sp_c-lf[0]*0.25*sp_s
+        sy2=self.y-fw[1]*0.25*sp_c-lf[1]*0.25*sp_s
+        sp2,=ax.plot([self.x,sx2],[self.y,sy2],"-",color="#f8c471",lw=2.2,zorder=10)
+        arts.append(sp2)
+        # Hareket yönü oku
         arts.append(ax.annotate("",xy=(self.x+0.38*c,self.y+0.38*s),
             xytext=(self.x,self.y),
-            arrowprops=dict(arrowstyle="->",color="#f8c471",lw=2.5),zorder=10))
+            arrowprops=dict(arrowstyle="->",color="#f8c471",lw=2.5),zorder=11))
         return arts
 
 
@@ -358,11 +431,11 @@ ROBOT_TYPES={"Differential":DiffDriveRobot,"Ackermann":AckermannRobot,
 
 # ─── LOKALİZASYON ───────────────────────────────────────────────────────────
 class DeadReckoning:
-    def __init__(self,x: float,y: float,theta: float,L: float = 0.5):
+    def __init__(self,x,y,theta,L=0.5):
         self.x=x; self.y=y; self.theta=theta; self.L=L
         self.history=[(x,y)]
 
-    def update(self,dl: float,dr: float):
+    def update(self,dl,dr):
         dS=(dl+dr)/2; dth=(dr-dl)/self.L
         self.x+=dS*math.cos(self.theta+dth/2)
         self.y+=dS*math.sin(self.theta+dth/2)
@@ -372,7 +445,7 @@ class DeadReckoning:
 
 class EKF:
     """EKF — durum: [x, y, θ]. IMU + LiDAR tarama eşleşmesi ile güncelleme."""
-    def __init__(self,x: float,y: float,theta: float,env: Environment,L: float = 0.5):
+    def __init__(self,x,y,theta,env,L=0.5):
         self.mu=np.array([x,y,theta],dtype=float)
         self.P=np.eye(3)*0.05
         self.L=L; self.env=env
@@ -383,11 +456,10 @@ class EKF:
         self._lid_ctr=0
         self.history=[(x,y)]
 
-    # ── Tahmin adımı (v, ω) ──
-    def predict_vw(self,v: float,omega: float,dt: float):
+    # ── Tahmin adımı (enkoder) ──
+    def predict(self,dl,dr):
         self._theta_prev=self.mu[2]
-        dth=omega*dt
-        dS=v*dt
+        dS=(dl+dr)/2; dth=(dr-dl)/self.L
         mid=self.mu[2]+dth/2
         F=np.array([[1,0,-dS*math.sin(mid)],
                     [0,1, dS*math.cos(mid)],
@@ -398,7 +470,7 @@ class EKF:
         self.P=F@self.P@F.T+self.Q
 
     # ── IMU ile açı düzeltmesi ──
-    def update_imu(self,omega_meas: float,dt: float):
+    def update_imu(self,omega_meas,dt):
         z_th=self._theta_prev+omega_meas*dt   # IMU'nun tahmin ettiği yeni açı
         H=np.array([[0,0,1]])
         S=H@self.P@H.T+self.R_imu
@@ -408,7 +480,7 @@ class EKF:
         self.P=(np.eye(3)-np.outer(K,H))@self.P
 
     # ── LiDAR tarama eşleşmesi ile konum düzeltmesi ──
-    def update_lidar(self,lidar_raw: np.ndarray,lidar_angles: np.ndarray):
+    def update_lidar(self,lidar_raw,lidar_angles):
         self._lid_ctr+=1
         self.history.append((float(self.mu[0]),float(self.mu[1])))
         if self._lid_ctr%4!=0:   # her 4 adımda bir LiDAR güncellemesi
@@ -433,7 +505,7 @@ class EKF:
             self.mu+=K.flatten()*innov
             self.P=(np.eye(3)-np.outer(K.flatten(),H))@self.P
 
-    def _cast(self,x: float,y: float,angle: float) -> float:
+    def _cast(self,x,y,angle):
         ca=math.cos(angle); sa=math.sin(angle)
         for d in np.arange(0.1,8.0,0.12):
             if not self.env.is_free(x+d*ca,y+d*sa,margin=0.0):
@@ -444,7 +516,7 @@ class EKF:
 # ─── NAVİGASYON ALGORİTMALARI ───────────────────────────────────────────────
 class AStarPlanner:
     name="A*"
-    def __init__(self,env: Environment,res: float = 0.4): self.env=env; self.res=res
+    def __init__(self,env,res=0.4,margin=0.32): self.env=env; self.res=res; self.mg=margin
 
     def plan(self,start,goal):
         g=lambda p:(int(round(p[0]/self.res)),int(round(p[1]/self.res)))
@@ -463,7 +535,7 @@ class AStarPlanner:
                 nb=(cur[0]+dx,cur[1]+dy)
                 if nb in cl: continue
                 wx2,wy2=w(nb)
-                if not self.env.is_free(wx2,wy2): continue
+                if not self.env.is_free(wx2,wy2,self.mg): continue
                 ng=gs[cur]+math.hypot(dx,dy)*self.res
                 if ng<gs.get(nb,1e18):
                     came[nb]=cur; gs[nb]=ng
@@ -473,7 +545,7 @@ class AStarPlanner:
 
 class DijkstraPlanner:
     name="Dijkstra"
-    def __init__(self,env: Environment,res: float = 0.4): self.env=env; self.res=res
+    def __init__(self,env,res=0.4,margin=0.32): self.env=env; self.res=res; self.mg=margin
 
     def plan(self,start,goal):
         g=lambda p:(int(round(p[0]/self.res)),int(round(p[1]/self.res)))
@@ -492,7 +564,7 @@ class DijkstraPlanner:
                 nb=(cur[0]+dx,cur[1]+dy)
                 if nb in cl: continue
                 wx2,wy2=w(nb)
-                if not self.env.is_free(wx2,wy2): continue
+                if not self.env.is_free(wx2,wy2,self.mg): continue
                 nd=d+math.hypot(dx,dy)*self.res
                 if nd<dist.get(nb,1e18):
                     came[nb]=cur; dist[nb]=nd
@@ -502,11 +574,12 @@ class DijkstraPlanner:
 
 class APFPlanner:
     name="APF"
-    def __init__(self,env: Environment,step: float = 0.22,k_att: float = 1.0,k_rep: float = 4.0,rep_r: float = 2.0):
+    def __init__(self,env,res=None,step=0.22,k_att=1.0,k_rep=4.0,rep_r=2.0,margin=0.32):
         self.env=env; self.step=step; self.k_att=k_att
-        self.k_rep=k_rep; self.rep_r=rep_r
+        self.k_rep=k_rep; self.rep_r=rep_r; self.mg=margin
 
     def plan(self,start,goal):
+        bd=self.mg+0.05   # kenar tamponu
         path=[start]; x,y=start; stuck=[]
         for _ in range(4000):
             if math.hypot(x-goal[0],y-goal[1])<0.5:
@@ -527,15 +600,19 @@ class APFPlanner:
             if mag<1e-6:
                 fx,fy=random.uniform(-1,1),random.uniform(-1,1)
                 mag=math.hypot(fx,fy)
-            x=float(np.clip(x+self.step*fx/mag,0.4,self.env.width-0.4))
-            y=float(np.clip(y+self.step*fy/mag,0.4,self.env.height-0.4))
+            x=float(np.clip(x+self.step*fx/mag,bd,self.env.width-bd))
+            y=float(np.clip(y+self.step*fy/mag,bd,self.env.height-bd))
             stuck.append((x,y))
             if len(stuck)>40:
                 stuck.pop(0)
-                if max(math.hypot(p[0]-x,p[1]-y) for p in stuck)<0.2:
-                    x+=random.uniform(-2,2); y+=random.uniform(-2,2)
-                    x=float(np.clip(x,0.4,self.env.width-0.4))
-                    y=float(np.clip(y,0.4,self.env.height-0.4))
+                # Hem sabit takılı hem de salınım (oscillation) tespiti
+                progress=math.hypot(stuck[0][0]-goal[0],stuck[0][1]-goal[1])-math.hypot(x-goal[0],y-goal[1])
+                truly_stuck=max(math.hypot(p[0]-x,p[1]-y) for p in stuck)<0.3
+                no_progress=progress<0.25
+                if truly_stuck or no_progress:
+                    x+=random.uniform(-3,3); y+=random.uniform(-3,3)
+                    x=float(np.clip(x,bd,self.env.width-bd))
+                    y=float(np.clip(y,bd,self.env.height-bd))
                     stuck.clear()
             path.append((x,y))
         return path
@@ -543,22 +620,23 @@ class APFPlanner:
 
 class RRTPlanner:
     name="RRT"
-    def __init__(self,env: Environment,step: float = 0.6,max_iter: int = 6000,goal_bias: float = 0.12):
+    def __init__(self,env,res=None,step=0.6,max_iter=6000,goal_bias=0.12,margin=0.32):
         self.env=env; self.step=step
-        self.max_iter=max_iter; self.goal_bias=goal_bias
+        self.max_iter=max_iter; self.goal_bias=goal_bias; self.mg=margin
 
     def plan(self,start,goal):
+        bd=self.mg+0.05
         nodes=[start]; parent={0:-1}
         for _ in range(self.max_iter):
             samp=(goal if random.random()<self.goal_bias else
-                  (random.uniform(0.4,self.env.width-0.4),
-                   random.uniform(0.4,self.env.height-0.4)))
+                  (random.uniform(bd,self.env.width-bd),
+                   random.uniform(bd,self.env.height-bd)))
             dists=[math.hypot(n[0]-samp[0],n[1]-samp[1]) for n in nodes]
             ni=int(np.argmin(dists)); nn=nodes[ni]; d=dists[ni]
             t=min(self.step/d,1.0) if d>0 else 1.0
             nw=(nn[0]+t*(samp[0]-nn[0]),nn[1]+t*(samp[1]-nn[1]))
-            if not self.env.is_free(*nw): continue
-            if not self.env.segment_free(nn[0],nn[1],nw[0],nw[1]): continue
+            if not self.env.is_free(*nw,self.mg): continue
+            if not self.env.segment_free(nn[0],nn[1],nw[0],nw[1],margin=self.mg): continue
             idx=len(nodes); nodes.append(nw); parent[idx]=ni
             if math.hypot(nw[0]-goal[0],nw[1]-goal[1])<self.step:
                 gi=len(nodes); nodes.append(goal); parent[gi]=idx
@@ -571,11 +649,31 @@ class RRTPlanner:
 PLANNERS={"A*":AStarPlanner,"Dijkstra":DijkstraPlanner,
           "APF":APFPlanner,"RRT":RRTPlanner}
 
+# Robota özgü planlama parametreleri
+ROBOT_PLAN_PARAMS={
+    "Differential": {"res":0.40,"margin":0.51},  # margin>0.5 → x=0.5 sol sinir disi, gecitlerden gec
+    "Ackermann":    {"res":0.50,"margin":0.51},  # x=0.5 sol sinir disi, gecitler acik
+    "Mecanum":      {"res":0.38,"margin":0.51},  # margin>0.5 → zigzag gecit rotasi
+    "Unicycle":     {"res":0.40,"margin":0.51},  # margin>0.5 → zigzag gecit rotasi
+}
+
+def _smooth_path(path, env, margin, steps=30):
+    """Açgözlü kısayol düzleştirme — Ackermann için keskin dönüşleri azaltır."""
+    if len(path)<3: return path
+    result=[path[0]]; i=0
+    while i<len(path)-1:
+        best=i+1
+        for j in range(len(path)-1,i+1,-1):
+            if env.segment_free(result[-1][0],result[-1][1],
+                                path[j][0],path[j][1],steps=steps,margin=margin):
+                best=j; break
+        result.append(path[best]); i=best
+    return result
+
 
 # ─── SİMÜLASYON ─────────────────────────────────────────────────────────────
 class Simulation:
-    def __init__(self, config: SimConfig):
-        self.cfg=config
+    def __init__(self):
         self.env=Environment()
         self.lidar=LiDAR(self.env)
         self.imu=IMU(); self.encoder=Encoder()
@@ -586,40 +684,52 @@ class Simulation:
     def reset(self):
         sx,sy=self.env.start
         self.robot=ROBOT_TYPES[self.robot_type](sx,sy,0.0)
-        self.dr=DeadReckoning(sx,sy,0.0, L=self.robot.L)
-        self.ekf=EKF(sx,sy,0.0,self.env, L=self.robot.L)
+        self.dr=DeadReckoning(sx,sy,0.0,L=self.robot.L)
+        self.ekf=EKF(sx,sy,0.0,self.env,L=self.robot.L)
         self.true_path=[(sx,sy)]
         self.lidar_raw=[]; self.lidar_filt=[]
         self.errors_ekf=[]; self.errors_dr=[]
         self.times=[]; self.t=0.0
         self.path_idx=0; self.done=False
-        self.plan_path=PLANNERS[self.nav_algo](self.env).plan(
-            self.env.start,self.env.goal)
+        pp=ROBOT_PLAN_PARAMS[self.robot_type]
+        raw=PLANNERS[self.nav_algo](self.env,**pp).plan(self.env.start,self.env.goal)
+        # Tüm robotlar için yol düzleştirme — waypoint sayısını azaltır
+        self.plan_path=_smooth_path(raw,self.env,pp["margin"],steps=50)
 
-    def step(self,dt: float = 0.1):
+    def step(self,dt=0.1):
         if self.done: return
-        if self.path_idx>=len(self.plan_path):
+        path=self.plan_path; n=len(path); r=self.robot
+        if self.path_idx>=n:
             self.done=True; return
-        target=self.plan_path[self.path_idx]
-        dist=math.hypot(target[0]-self.robot.x,target[1]-self.robot.y)
-        if dist<0.35:
-            self.path_idx+=1; return
 
-        v_cmd,omega_cmd=self.robot.control(target[0],target[1])
-        omega_used=self.robot.true_omega(v_cmd, omega_cmd)
-        v_for_ekf=v_cmd
-        if getattr(self.robot, "holonomic", False):
-            v_for_ekf=math.hypot(getattr(self.robot, "vx_w", 0.0), getattr(self.robot, "vy_w", 0.0))
+        if self.robot_type=="Ackermann":
+            # Arkada kalan veya çok yakın waypoint'leri atla
+            while self.path_idx<n-1:
+                wx,wy=path[self.path_idx]
+                dx,dy=wx-r.x,wy-r.y
+                fwd=dx*math.cos(r.theta)+dy*math.sin(r.theta)
+                if math.hypot(dx,dy)<0.5 or fwd<-0.15:
+                    self.path_idx+=1
+                else: break
+            if self.path_idx>=n: self.done=True; return
+            target=self._lookahead_target()
+        else:
+            target=path[self.path_idx]
+            if math.hypot(target[0]-r.x,target[1]-r.y)<0.35:
+                self.path_idx+=1; return
 
-        dl_t,dr_t=self.robot.step(v_cmd,omega_cmd,dt)
+        v,omega=self.robot.control(target[0],target[1])
+        dl_t,dr_t=self.robot.step(v,omega,dt)
+        r.x=float(np.clip(r.x,0.1,self.env.width-0.1))
+        r.y=float(np.clip(r.y,0.1,self.env.height-0.1))
         dl_e,dr_e=self.encoder.measure(dl_t,dr_t)
-        om_i=self.imu.measure(omega_used)
+        om_i=self.imu.measure(omega)
         raw,filt=self.lidar.scan(self.robot.x,self.robot.y,self.robot.theta)
         self.lidar_raw=self.lidar.to_points(self.robot.x,self.robot.y,self.robot.theta,raw)
         self.lidar_filt=self.lidar.to_points(self.robot.x,self.robot.y,self.robot.theta,filt)
 
         self.dr.update(dl_e,dr_e)
-        self.ekf.predict_vw(v_for_ekf, omega_used, dt)
+        self.ekf.predict(dl_e,dr_e)
         self.ekf.update_imu(om_i,dt)
         self.ekf.update_lidar(raw,self.lidar.angles)
 
@@ -633,17 +743,29 @@ class Simulation:
                       self.robot.y-self.env.goal[1])<0.5:
             self.done=True
 
+    def _lookahead_target(self,L_d=0.9):
+        """Ackermann Pure Pursuit: yol üzerinde L_d mesafedeki noktayı döndürür."""
+        path=self.plan_path; r=self.robot; n=len(path)
+        if self.path_idx>=n-1: return path[-1]
+        px,py=path[self.path_idx]
+        cum=math.hypot(px-r.x,py-r.y)
+        if cum>=L_d: return (px,py)
+        for i in range(self.path_idx,n-1):
+            seg=math.hypot(path[i+1][0]-path[i][0],path[i+1][1]-path[i][1])
+            if cum+seg>=L_d:
+                t=(L_d-cum)/seg if seg>0 else 0.0
+                return (path[i][0]+t*(path[i+1][0]-path[i][0]),
+                        path[i][1]+t*(path[i+1][1]-path[i][1]))
+            cum+=seg
+        return path[-1]
+
 
 # ─── GRAFİK ARAYÜZÜ ─────────────────────────────────────────────────────────
 class GUI:
-    def __init__(self, config: SimConfig):
-        self.cfg=config
-        self.sim=Simulation(config)
+    def __init__(self):
+        self.sim=Simulation()
         self.timer=None
-        self._dyn_arts=[]
-        self._lidar_lc: LineCollection | None = None
-        self._last_frame_t=time.perf_counter()
-        self._fps=0.0
+        self._dyn_arts=[]   # çerçeveden çerçeveye silinen dinamik sanatçılar
         self._build()
 
     # ── İnşa ────────────────────────────────────────────────────────────────
@@ -690,16 +812,20 @@ class GUI:
         for l in self.radio_loc.labels: l.set_color("white"); l.set_fontsize(9)
 
         # Butonlar
-        ax_s=self.fig.add_axes((0.02,0.35,0.11,0.06))
+        ax_s=self.fig.add_axes((0.02,0.36,0.11,0.055))
         self.btn_start=Button(ax_s,"BASLA ▶",color=ACC,hovercolor="#c0392b")
         self.btn_start.label.set_color("white"); self.btn_start.label.set_fontweight("bold")
 
-        ax_r=self.fig.add_axes((0.02,0.27,0.11,0.06))
+        ax_r=self.fig.add_axes((0.02,0.29,0.11,0.055))
         self.btn_reset=Button(ax_r,"SIFIRLA ↺",color="#533483",hovercolor="#6a44a0")
         self.btn_reset.label.set_color("white")
 
+        ax_rnd=self.fig.add_axes((0.02,0.22,0.11,0.055))
+        self.btn_rand=Button(ax_rnd,"RASTGELE ⟳",color="#117a65",hovercolor="#1abc9c")
+        self.btn_rand.label.set_color("white"); self.btn_rand.label.set_fontsize(8)
+
         # Metrik paneli
-        self.ax_met=self.fig.add_axes((0.01,0.05,0.14,0.20),facecolor=PANEL)
+        self.ax_met=self.fig.add_axes((0.01,0.05,0.14,0.15),facecolor=PANEL)
         self.ax_met.axis("off")
         self.txt_met=self.ax_met.text(0.05,0.95,self._metric_str(),
             transform=self.ax_met.transAxes,color="white",
@@ -710,6 +836,7 @@ class GUI:
         self.radio_loc.on_clicked(self._on_loc)
         self.btn_start.on_clicked(self._on_start)
         self.btn_reset.on_clicked(self._on_reset)
+        self.btn_rand.on_clicked(self._on_rand)
 
     # ── Statik harita (sadece reset/değişim sırasında çizilir) ──────────────
     def _draw_map(self):
@@ -730,15 +857,18 @@ class GUI:
         for i,(x1,y1,x2,y2) in enumerate(env.obstacles):
             ax.add_patch(patches.FancyBboxPatch(
                 (x1,y1),x2-x1,y2-y1,boxstyle="round,pad=0.04",
-                lw=1,edgecolor="#FFD700",facecolor=SHELF_COLORS[i],alpha=0.90,zorder=2))
+                lw=1,edgecolor="#FFD700",
+                facecolor=SHELF_COLORS[i%len(SHELF_COLORS)],alpha=0.90,zorder=2))
             ax.text((x1+x2)/2,(y1+y2)/2,env.labels[i],
                 ha="center",va="center",color="white",fontsize=4.5,fontweight="bold",zorder=3)
 
-        for gx,gy,lbl in [(13.0,4.75,"→"),(9.75,8.75,"↑"),(6.75,12.25,"←")]:
-            ax.text(gx,gy,lbl,ha="center",va="center",color="#00ffcc",
-                    fontsize=10,fontweight="bold",zorder=4,
-                    bbox=dict(boxstyle="round,pad=0.15",facecolor="#003333",
-                              alpha=0.75,edgecolor="#00ffcc",lw=1))
+        # Zigzag geçit oklarını sadece varsayılan haritada göster
+        if not env.is_random:
+            for gx,gy,lbl in [(13.0,4.75,"→"),(9.75,8.75,"↑"),(6.75,12.25,"←")]:
+                ax.text(gx,gy,lbl,ha="center",va="center",color="#00ffcc",
+                        fontsize=10,fontweight="bold",zorder=4,
+                        bbox=dict(boxstyle="round,pad=0.15",facecolor="#003333",
+                                  alpha=0.75,edgecolor="#00ffcc",lw=1))
 
         ax.plot(*env.start,"o",color="#2ecc71",ms=10,zorder=5)
         ax.plot(*env.goal, "*",color="#e74c3c",ms=13,zorder=5)
@@ -758,13 +888,9 @@ class GUI:
         self._ln_dr,  =ax.plot([],[],"--",color="#ffd166",lw=0.9,alpha=0.75,zorder=3,label="DR")
         ax.legend(loc="upper left",fontsize=6.5,facecolor=PANEL,
                   labelcolor="white",framealpha=0.8)
-
-        # LiDAR çizgileri (tek LineCollection ile, performans için)
-        self._lidar_lc = LineCollection([], colors="#e74c3c", linewidths=0.5, alpha=0.10, zorder=2)
-        ax.add_collection(self._lidar_lc)
         self._dyn_arts=[]
 
-    # ── Hızlı güncelleme (her tick) ────────────────────────────���────────────
+    # ── Hızlı güncelleme (her tick) ─────────────────────────────────────────
     def _update_map(self):
         if len(self.sim.true_path)>1:
             tp=np.array(self.sim.true_path)
@@ -785,14 +911,13 @@ class GUI:
         # Robot çiz
         self._dyn_arts.extend(self.sim.robot.draw(self.ax_map))
 
-        # LiDAR ışınları (LineCollection)
-        if self._lidar_lc is not None:
-            r=self.sim.robot
-            segs=[]
-            for i,(px,py) in enumerate(self.sim.lidar_raw):
-                if i%self.cfg.lidar_ray_stride==0:
-                    segs.append([(r.x,r.y),(px,py)])
-            self._lidar_lc.set_segments(segs)
+        # LiDAR ışınları (her 6. ışın)
+        r=self.sim.robot
+        for i,(px,py) in enumerate(self.sim.lidar_raw):
+            if i%6==0:
+                ln,=self.ax_map.plot([r.x,px],[r.y,py],"-",
+                                     color="#e74c3c",alpha=0.10,lw=0.5,zorder=2)
+                self._dyn_arts.append(ln)
 
     def _update_lidar(self):
         ax=self.ax_lidar; ax.clear(); self._style(ax)
@@ -855,8 +980,7 @@ class GUI:
             return ("Metrikler:\n──────────\n"
                     "Yol: —\nSure: —\nRMSE EKF: —\nRMSE DR:  —\n"
                     f"Nav: {sim.nav_algo}\nRobot: {sim.robot_type}\n"
-                    f"Lok: {sim.loc_algo}\nFPS: {self._fps:.1f}\n"
-                    "──────────\nHazir")
+                    f"Lok: {sim.loc_algo}\n──────────\nHazir")
         pl=sum(math.hypot(sim.true_path[i][0]-sim.true_path[i-1][0],
                           sim.true_path[i][1]-sim.true_path[i-1][1])
                for i in range(1,len(sim.true_path)))
@@ -867,35 +991,23 @@ class GUI:
                 f"Yol: {pl:.1f} m\nSure: {sim.t:.1f} s\n"
                 f"RMSE EKF: {re:.3f} m\nRMSE DR:  {rd:.3f} m\n"
                 f"Nav: {sim.nav_algo}\nRobot: {sim.robot_type}\n"
-                f"Lok: {sim.loc_algo}\nFPS: {self._fps:.1f}\n"
-                f"──────────\n{st}")
+                f"Lok: {sim.loc_algo}\n──────────\n{st}")
 
     # ── Tick ────────────────────────────────────────────────────────────────
     def _tick(self):
         try:
-            for _ in range(self.cfg.steps_per_tick):
+            for _ in range(4):
                 if not self.sim.done:
-                    self.sim.step(dt=self.cfg.dt)
+                    self.sim.step(dt=0.1)
             self._update_map()
-            if self.cfg.lidar_update_every == 1 or (self.sim.t / self.cfg.dt) % self.cfg.lidar_update_every == 0:
-                self._update_lidar()
-            if self.cfg.loc_update_every == 1 or (self.sim.t / self.cfg.dt) % self.cfg.loc_update_every == 0:
-                self._update_loc()
-            if self.cfg.err_update_every == 1 or (self.sim.t / self.cfg.dt) % self.cfg.err_update_every == 0:
-                self._update_err()
+            self._update_lidar()
+            self._update_loc()
+            self._update_err()
             self._update_metrics()
-
-            now=time.perf_counter()
-            dt=now-self._last_frame_t
-            if dt>1e-6:
-                inst_fps=1.0/dt
-                self._fps=(1-self.cfg.fps_ema_alpha)*self._fps + self.cfg.fps_ema_alpha*inst_fps
-            self._last_frame_t=now
-
             self.fig.canvas.draw_idle()
             if self.sim.done and self.timer is not None:
                 self.timer.stop()
-        except Exception:
+        except Exception as e:
             import traceback; traceback.print_exc()
             if self.timer is not None:
                 self.timer.stop()
@@ -903,7 +1015,7 @@ class GUI:
     # ── Callback'ler ────────────────────────────────────────────────────────
     def _on_start(self,_):
         self._stop_timer()
-        self.timer=self.fig.canvas.new_timer(interval=self.cfg.timer_ms)
+        self.timer=self.fig.canvas.new_timer(interval=50)
         self.timer.add_callback(self._tick)
         self.timer.start()
 
@@ -932,6 +1044,15 @@ class GUI:
         self.sim.reset(); self._draw_map()
         self._update_metrics(); self.fig.canvas.draw_idle()
 
+    def _on_rand(self,_):
+        """Engelleri rastgele yenile ve yeniden planla."""
+        self._stop_timer()
+        self.sim.env.randomize()
+        self.sim.reset(); self._draw_map()
+        for ax in (self.ax_lidar,self.ax_loc,self.ax_err):
+            ax.clear(); self._style(ax)
+        self._update_metrics(); self.fig.canvas.draw_idle()
+
     def _stop_timer(self):
         if self.timer is not None:
             self.timer.stop(); self.timer=None
@@ -942,6 +1063,5 @@ class GUI:
 
 # ─── GİRİŞ ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    cfg=SimConfig()
-    gui=GUI(cfg)
+    gui=GUI()
     gui.run()
